@@ -8,6 +8,8 @@
 
 import { createRequire } from 'module';
 
+import Redis from 'ioredis';
+
 import crypto from 'crypto';
 
 const require = createRequire(import.meta.url);
