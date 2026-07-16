@@ -6,6 +6,8 @@
 // Модели с рефами: "nano banana 2" (дефолт), "grok". БЕЗ рефов: "novelai", "grok-pro".
 // ═══════════════════════════════════════════════════════════════
 
+import { createRequire } from 'module';
+
 import crypto from 'crypto';
 
 const require = createRequire(import.meta.url);
