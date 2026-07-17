@@ -370,10 +370,18 @@ export default async function handler(req, res) {
     // Заменяем generic-слова на имена персонажей
     const cleanPrompt = replaceGenericWords(prompt, chars);
 
-    // Жёсткая инструкция: точное соответствие лиц референсам
+    // ---- Модель и поддержка референсов ----
+    const NAISTERA_REF_MODELS = ['nano banana 2', 'grok'];   // рефы работают только тут
+    const naisteraModel = (model && String(model).trim()) || 'nano banana 2';
+    const refsSupported = NAISTERA_REF_MODELS.includes(naisteraModel.toLowerCase());
+    const aspectRatio = (req.query.aspect_ratio || req.query.aspectRatio || '3:2');
+
+    // Жёсткая инструкция: точное соответствие лиц референсам.
+    // Только когда рефы реально уйдут в запрос — иначе модель (novelai/grok-pro)
+    // получает указание копировать несуществующие картинки.
     let faceLock = '';
     const named = chars.filter(c => c && c.name && c.url).map(c => c.name);
-    if (named.length > 0) {
+    if (refsSupported && named.length > 0) {
       faceLock = `[CRITICAL: The reference image(s) show the EXACT appearance of ${named.join(' and ')}. You MUST precisely copy their: face structure, eye color, hair color and style, skin tone, body type, clothing, and all distinctive features. Do not deviate from the reference appearances.]\n\n`;
     }
     const fullPrompt = `${faceLock}${finalStyle}\n\n${cleanPrompt}`;
@@ -406,12 +414,6 @@ export default async function handler(req, res) {
     }
     if (cachedUrl) return res.redirect(302, cachedUrl);
     console.log(isReroll ? '🔁 [5/9] Генерация (реролл)' : '❌ [5/9] Кэш промах, генерация');
-
-    // ---- Модель и поддержка референсов ----
-    const NAISTERA_REF_MODELS = ['nano banana 2', 'grok'];   // рефы работают только тут
-    const naisteraModel = (model && String(model).trim()) || 'nano banana 2';
-    const refsSupported = NAISTERA_REF_MODELS.includes(naisteraModel.toLowerCase());
-    const aspectRatio = (req.query.aspect_ratio || req.query.aspectRatio || '3:2');
 
     console.log(`🤖 [7/9] Запрос в Naistera (${naisteraModel}, ${aspectRatio})...`);
 
