@@ -392,15 +392,18 @@ export default async function handler(req, res) {
     const fullPrompt = `${faceLock}${finalStyle}\n\n${cleanPrompt}`;
 
     // ---- Кэш и блокировка ----
-    // Реролл: если есть _r — пропускаем чтение кэша (но запишем свежий результат)
-    const isReroll = !!req.query._r;
-    if (isReroll) console.log('🔁 Реролл — кэш пропускается');
-    const cacheKey = getCacheKey(userId, prompt, charactersRaw, finalStyle);
+    // Каждый реролл кэшируется ОТДЕЛЬНО — по своему _r. Это принципиально:
+    // в историю на клиенте сохраняется именно этот URL (с _r), и при листании
+    // рероллов он запрашивается снова. Раньше _r отключал кэш → каждое листание
+    // жгло токены заново. Теперь новый _r = новая генерация, повтор того же _r = кэш.
+    const rerollTag = String(req.query._r || '');
+    const isReroll = !!rerollTag;
+    const cacheKey = getCacheKey(userId, prompt, charactersRaw, finalStyle + '|r=' + rerollTag);
     let cachedUrl = null;
     let lockAcquired = false;
     const lockKey = `lock:${cacheKey}`;
 
-    if (redis && !isReroll) {
+    if (redis) {
       console.log('🔄 [5/9] Проверка кэша...');
       try { cachedUrl = await redis.get(cacheKey); } catch(e) { console.warn('Redis error:', e.message); }
       if (!cachedUrl) {
