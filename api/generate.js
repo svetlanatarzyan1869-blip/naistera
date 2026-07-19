@@ -350,10 +350,21 @@ export default async function handler(req, res) {
     // Стиль: ключ из каталога → его описание; иначе произвольный текст юзера как есть;
     // иначе дефолт. Лимит — чтобы длинное полотно не съедало таймаут генерации.
     const MAX_STYLE_LEN = 300;
+    // Нормализация ключа стиля: "Kodak Portra 400", "Kodak-Portra-400", " KODAK PORTRA 400 "
+    // → "kodak_portra_400". Без этого любая мелкая опечатка/другой регистр молча
+    // уезжали как «кастомный стиль» вместо стиля из каталога.
+    function normStyleKey(s){
+      return String(s || '').trim().toLowerCase()
+        .replace(/[\s\-]+/g, '_')     // пробелы и дефисы → подчёркивание
+        .replace(/[^a-z0-9_]/g, '')    // остальное убираем
+        .replace(/_+/g, '_')
+        .replace(/^_|_$/g, '');
+    }
     let finalStyle;
-    if (style && styleMap[style.toLowerCase()]) {
-      finalStyle = styleMap[style.toLowerCase()];
-      console.log(`🎨 [4/9] Стиль "${style}" заменён`);
+    const styleKey = normStyleKey(style);
+    if (styleKey && styleMap[styleKey]) {
+      finalStyle = styleMap[styleKey];
+      console.log(`🎨 [4/9] Стиль "${style}" → каталог "${styleKey}"`);
     } else if (style && style.trim()) {
       finalStyle = style.trim().slice(0, MAX_STYLE_LEN);
       console.log(`🎨 [4/9] Кастомный стиль (${finalStyle.length} симв.)`);
