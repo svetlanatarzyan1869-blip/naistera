@@ -82,6 +82,8 @@ function friendlyErrorObj(raw) {
     return {title:'Контент заблокирован фильтром', advice:'Упрости промт, замени референс на нейтральный или смени модель'};
   if (/IMAGE_SAFETY/i.test(s) || /safety/i.test(s))
     return {title:'Контент заблокирован по безопасности', advice:'Измени описание сцены и попробуй снова'};
+  if (/prohibited[_\s-]?content|content[_\s-]?prohibited|запрещённ|запрещенн/i.test(s))
+    return {title:'Контент заблокирован цензурой', advice:'Модель отказалась рисовать по этому запросу. Смягчи описание, замени референс или смени модель'};
   if (/blocked/i.test(s) && /refunded/i.test(s))
     return {title:'Заблокировано фильтром', advice:'Кредиты возвращены. Попробуй другой промт или модель'};
   if (/possibly filtered/i.test(s) || /No images? (in response|generated)/i.test(s))
@@ -90,12 +92,18 @@ function friendlyErrorObj(raw) {
     return {title:'Слишком много запросов', advice:'Подожди минуту и попробуй снова'};
   if (/cannot import/i.test(s))
     return {title:'Технический сбой Naistera', advice:'Это на их стороне. Подожди несколько минут или смени модель'};
+  if (/no available channel|model_not_found|model not found/i.test(s))
+    return {title:'Модель недоступна на этом ключе', advice:'Выбери другую модель на сайте или проверь ключ'};
   if (/HTTP 404/i.test(s) || /Not Found/i.test(s))
-    return {title:'Эндпоинт недоступен', advice:'Эта модель сейчас недоступна на Naistera. Используй gemini-модель'};
+    return {title:'Эндпоинт недоступен', advice:'Naistera сейчас недоступна. Попробуй позже или смени провайдера'};
   if (/upstream_error/i.test(s))
     return {title:'Ошибка на стороне Naistera', advice:'Попробуй ещё раз через минуту'};
-  if (/network error/i.test(s))
-    return {title:'Ошибка сети', advice:'Проверь соединение и попробуй снова'};
+  if (/abort|timed? ?out|timeout|ETIMEDOUT/i.test(s))
+    return {title:'Генерация не успела за отведённое время', advice:'Сервер долго отвечал. Попробуй ещё раз или выбери модель полегче'};
+  if (/network error|fetch failed|ENOTFOUND|ECONNREFUSED|ECONNRESET|socket hang up|EAI_AGAIN/i.test(s))
+    return {title:'Нет связи с сервером', advice:'Проверь соединение и попробуй снова через минуту'};
+  if (/Unexpected token|not valid json|invalid json|JSON at position|<!DOCTYPE|<html/i.test(s))
+    return {title:'Naistera вернул ошибку вместо картинки', advice:'Обычно это временный сбой у них. Попробуй ещё раз или смени модель'};
   if (/HTTP 5/i.test(s))
     return {title:'Сервер Naistera недоступен', advice:'Попробуй через минуту'};
   if (/No image from Naistera/i.test(s) || /Нет изображения/i.test(s))
@@ -110,7 +118,7 @@ function friendlyErrorObj(raw) {
     return {title:'Ссылка ведёт не на картинку', advice:'Используй прямую ссылку i.ibb.co/.../file.jpg, а не страницу ImgBB'};
   if (/bad decrypt/i.test(s) || /Ошибка расшифровки/i.test(s))
     return {title:'Ошибка расшифровки', advice:'Ключ не совпадает. Перешифруй данные на сайте настройки'};
-  return {title:'Что-то пошло не так', advice: s.length > 100 ? s.slice(0,100)+'…' : s};
+  return {title:'Непредвиденная ошибка', advice:'Попробуй ещё раз или смени модель. Если повторяется — перешифруй данные на сайте'};
 }
 
 // ---------- Замена generic-слов на имена персонажей ----------
