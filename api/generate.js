@@ -14,7 +14,8 @@ import crypto from 'crypto';
 
 const require = createRequire(import.meta.url);
 
-export const maxDuration = 300;
+// Vercel Hobby жёстко режет функцию на 60с; >60 просто клампится. Поднимать до 300 после Pro.
+export const maxDuration = 60;
 
 // ---------- SVG-ошибка ----------
 function errorSvg(res, title, advice) {
@@ -31,19 +32,22 @@ function errorSvg(res, title, advice) {
     if (line) out.push(line.trim());
     return out;
   };
-  const titleLines = wrap(title, 48);
-  const adviceLines = advice ? wrap(advice, 56) : [];
-  const lineH = 20;
-  let y = 70;
+  // Узкий viewBox (440) → тот же <img width:100%> растягивает SVG на карточку,
+  // текст крупнее (особенно на телефоне).
+  const W = 440, CX = 220;
+  const titleLines = wrap(title, 30);
+  const adviceLines = advice ? wrap(advice, 34) : [];
+  const lineH = 26;
+  let y = 78;
   const titleRows = titleLines.map((l,i) =>
-    `<text x="340" y="${y + i*22}" font-family="system-ui,sans-serif" font-size="16" font-weight="600" fill="#f0e6ff" text-anchor="middle">${esc(l)}</text>`
+    `<text x="${CX}" y="${y + i*28}" font-family="system-ui,sans-serif" font-size="21" font-weight="600" fill="#f0e6ff" text-anchor="middle">${esc(l)}</text>`
   ).join('\n  ');
-  y += titleLines.length * 22 + 8;
+  y += titleLines.length * 28 + 10;
   const adviceRows = adviceLines.map((l,i) =>
-    `<text x="340" y="${y + i*lineH}" font-family="system-ui,sans-serif" font-size="13" fill="#9d8fc4" text-anchor="middle">${esc(l)}</text>`
+    `<text x="${CX}" y="${y + i*lineH}" font-family="system-ui,sans-serif" font-size="16" fill="#9d8fc4" text-anchor="middle">${esc(l)}</text>`
   ).join('\n  ');
-  const totalH = Math.max(160, y + adviceLines.length * lineH + 24);
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="680" height="${totalH}" viewBox="0 0 680 ${totalH}">
+  const totalH = Math.max(170, y + adviceLines.length * lineH + 28);
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${totalH}" viewBox="0 0 ${W} ${totalH}">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#1a1018"/>
@@ -54,14 +58,20 @@ function errorSvg(res, title, advice) {
       <stop offset="100%" stop-color="#ec4899"/>
     </linearGradient>
   </defs>
-  <rect width="680" height="${totalH}" rx="16" fill="url(#bg)" stroke="url(#accent)" stroke-width="1.5" stroke-opacity="0.4"/>
-  <circle cx="340" cy="34" r="14" fill="none" stroke="url(#accent)" stroke-width="2">
+  <rect width="${W}" height="${totalH}" rx="16" fill="url(#bg)" stroke="url(#accent)" stroke-width="1.5" stroke-opacity="0.4"/>
+  <circle cx="${CX}" cy="40" r="15" fill="none" stroke="url(#accent)" stroke-width="2">
     <animate attributeName="stroke-opacity" values="1;0.3;1" dur="1.8s" repeatCount="indefinite"/>
   </circle>
-  <text x="340" y="40" font-family="system-ui,sans-serif" font-size="16" fill="#ec4899" text-anchor="middle">!</text>
+  <text x="${CX}" y="46" font-family="system-ui,sans-serif" font-size="17" fill="#ec4899" text-anchor="middle">!</text>
   ${titleRows}
   ${adviceRows}
 </svg>`;
+  // Текст ошибки — ещё и в заголовке: новый плагин рисует его HTML-текстом в карточке
+  // (авто-перенос по ширине + цвета темы). Старые клиенты видят SVG-картинку.
+  try {
+    res.setHeader('Access-Control-Expose-Headers', 'X-ImageGen-Error');
+    res.setHeader('X-ImageGen-Error', Buffer.from(JSON.stringify({ title: String(title||''), advice: String(advice||'') }), 'utf-8').toString('base64'));
+  } catch(e) {}
   res.setHeader('Content-Type', 'image/svg+xml');
   return res.status(200).send(svg);
 }
@@ -109,7 +119,9 @@ function friendlyErrorObj(raw) {
   if (/No image from Naistera/i.test(s) || /Нет изображения/i.test(s))
     return {title:'Naistera не вернул изображение', advice:'Попробуй ещё раз или смени модель'};
   if (/Invalid API v1 key/i.test(s) || /imgbb.*key/i.test(s))
-    return {title:'Неверный ImgBB ключ', advice:'Перешифруй данные заново на сайте настройки'};
+    return {title:'ImgBB отклонил загрузку', advice:'Если ключ точно верный — это временный лимит ImgBB (много картинок подряд), подожди минуту. Иначе перешифруй данные на сайте'};
+  if (/imgbb.*(rate|limit|too many|429)/i.test(s))
+    return {title:'Лимит ImgBB', advice:'Слишком много загрузок подряд. Подожди минуту и попробуй снова'};
   if (/Invalid encrypted data/i.test(s) || /Missing key/i.test(s))
     return {title:'Неверный ключ конфигурации', advice:'Перешифруй данные на сайте настройки'};
   if (/Missing imgbb/i.test(s))
@@ -193,7 +205,14 @@ try {
 const redisUrl = process.env.REDIS_URL || process.env.KV_URL;
 let redis = null;
 if (redisUrl) {
-  redis = new Redis(redisUrl);
+  // Таймауты ОБЯЗАТЕЛЬНЫ: голый ioredis на serverless виснет на первом get и держит
+  // функцию до maxDuration. commandTimeout режет зависшую команду → код ловит и пропускает кэш.
+  redis = new Redis(redisUrl, {
+    connectTimeout: 3000,
+    commandTimeout: 3000,
+    maxRetriesPerRequest: 2,
+    retryStrategy: (times) => (times > 3 ? null : Math.min(times * 200, 1000)),
+  });
   redis.on('error', (err) => console.warn('Redis warning:', err.message));
 }
 
@@ -204,22 +223,40 @@ function getCacheKey(userId, prompt, characters, style) {
   return `img:${hash}`;
 }
 
-async function fetchImageBuffer(url) {
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), timeoutMs);
+  try { return await fetch(url, { ...options, signal: ctrl.signal }); }
+  finally { clearTimeout(to); }
+}
+
+async function fetchImageBuffer(url, timeoutMs = 15000) {
   // Авто-фикс ссылки на страницу ImgBB → прямую ссылку
   if (/^https?:\/\/ibb\.co\/[a-zA-Z0-9]+$/.test(url)) {
     try {
-      const pageRes = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const pageRes = await fetchWithTimeout(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 8000);
       const html = await pageRes.text();
       const match = html.match(/https:\/\/i\.ibb\.co\/[^"'\s]+\.(?:jpg|jpeg|png|webp|gif)/i);
       if (match) { console.log(`🔗 Fixed ImgBB URL: ${url} → ${match[0]}`); url = match[0]; }
     } catch(e) { console.warn('ImgBB URL fix failed:', e.message); }
   }
-  const res = await fetch(url, { headers: { Accept: 'image/*' } });
+  const res = await fetchWithTimeout(url, { headers: { Accept: 'image/*' } }, timeoutMs);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const contentType = res.headers.get('content-type') || 'image/png';
   if (!contentType.startsWith('image/')) throw new Error(`Not an image: ${contentType}`);
   const buf = Buffer.from(await res.arrayBuffer());
   return { buf, contentType };
+}
+
+// Кэш референса в Redis по URL (data URL — как раз то, что ждёт Naistera): качаем ОДИН раз,
+// рероллы/повторы берут из кэша мгновенно. Медленный/битый реф не роняет запрос.
+async function getRefDataUrl(url, redis) {
+  const key = 'ref:' + crypto.createHash('sha1').update(url).digest('hex');
+  if (redis) { try { const c = await redis.get(key); if (c) return c; } catch (e) {} }
+  const { buf, contentType } = await fetchImageBuffer(url, 15000);
+  const dataUrl = `data:${contentType};base64,${buf.toString('base64')}`;
+  if (redis) { try { await redis.set(key, dataUrl, 'EX', 604800); } catch (e) {} }
+  return dataUrl;
 }
 
 function extFromContentType(ct) {
@@ -424,20 +461,23 @@ export default async function handler(req, res) {
 
     if (redis) {
       console.log('🔄 [5/9] Проверка кэша...');
-      try { cachedUrl = await redis.get(cacheKey); } catch(e) { console.warn('Redis error:', e.message); }
-      if (!cachedUrl) {
-        const locked = await redis.set(lockKey, 'locked', 'EX', 2, 'NX');
-        if (locked) {
-          lockAcquired = true;
-          console.log(`🔒 Блокировка получена`);
-        } else {
-          console.log(`⏳ Ожидание блокировки`);
-          await new Promise(resolve => setTimeout(resolve, 600));
-          const retryCache = await redis.get(cacheKey);
-          if (retryCache) return res.redirect(302, retryCache);
-          else await redis.del(lockKey);
+      // Весь блок кэша/лока обёрнут: любой сбой/таймаут Redis → генерим без кэша, не виснем.
+      try {
+        cachedUrl = await redis.get(cacheKey);
+        if (!cachedUrl) {
+          const locked = await redis.set(lockKey, 'locked', 'EX', 2, 'NX');
+          if (locked) {
+            lockAcquired = true;
+            console.log(`🔒 Блокировка получена`);
+          } else {
+            console.log(`⏳ Ожидание блокировки`);
+            await new Promise(resolve => setTimeout(resolve, 600));
+            const retryCache = await redis.get(cacheKey);
+            if (retryCache) return res.redirect(302, retryCache);
+            else { try { await redis.del(lockKey); } catch(e){} }
+          }
         }
-      }
+      } catch(e) { console.warn('Redis error (пропускаю кэш):', e.message); cachedUrl = null; }
     }
     if (cachedUrl) return res.redirect(302, cachedUrl);
     console.log(isReroll ? '🔁 [5/9] Генерация (реролл)' : '❌ [5/9] Кэш промах, генерация');
@@ -447,15 +487,17 @@ export default async function handler(req, res) {
     // ---- Референсы: скачиваем с ImgBB → data URL (Naistera ждёт именно data URL) ----
     const referenceImages = [];
     if (refsSupported) {
-      for (const c of chars) {
-        if (!c.url) continue;
-        if (referenceImages.length >= 5) { console.log('   ⚠️ лимит 5 референсов достигнут'); break; }
+      // ПАРАЛЛЕЛЬНО, с таймаутом (15с) и кэшем в Redis (лимит Naistera — 5).
+      // Медленный/битый реф пропускается, а не ждём его до 60с последовательно.
+      const refChars = chars.filter(c => c && c.url).slice(0, 5);
+      const refResults = await Promise.all(refChars.map(async (c) => {
         try {
-          const { buf, contentType } = await fetchImageBuffer(c.url);
-          referenceImages.push(`data:${contentType};base64,${buf.toString('base64')}`);
-          console.log(`   ✅ "${c.name}" загружен (${buf.length} bytes)`);
-        } catch(e) { console.warn(`   ⚠️ "${c.name}": ${e.message}`); }
-      }
+          const dataUrl = await getRefDataUrl(c.url, redis);
+          console.log(`   ✅ "${c.name}" готов`);
+          return dataUrl;
+        } catch(e) { console.warn(`   ⚠️ "${c.name}" пропущен: ${e.message}`); return null; }
+      }));
+      for (const du of refResults) { if (du) referenceImages.push(du); }
     } else {
       console.log(`   ℹ️ Модель "${naisteraModel}" не поддерживает референсы — пропускаем`);
     }
