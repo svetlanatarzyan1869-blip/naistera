@@ -18,7 +18,7 @@ const require = createRequire(import.meta.url);
 export const maxDuration = 60;
 
 // ---------- SVG-ошибка ----------
-function errorSvg(res, title, advice) {
+function errorSvg(res, title, advice, retry, log) {
   const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   // Перенос строк для совета
   const wrap = (text, max) => {
@@ -70,10 +70,12 @@ function errorSvg(res, title, advice) {
   // (авто-перенос по ширине + цвета темы). Старые клиенты видят SVG-картинку.
   try {
     res.setHeader('Access-Control-Expose-Headers', 'X-ImageGen-Error');
-    res.setHeader('X-ImageGen-Error', Buffer.from(JSON.stringify({ title: String(title||''), advice: String(advice||'') }), 'utf-8').toString('base64'));
+    res.setHeader('X-ImageGen-Error', Buffer.from(JSON.stringify({ title: String(title||''), advice: String(advice||''), retry: retry === false ? false : true }), 'utf-8').toString('base64'));
   } catch(e) {}
   res.setHeader('Content-Type', 'image/svg+xml');
-  return res.status(200).send(svg);
+  var outBody = svg;
+  if (log && log.length) { try { var NL = String.fromCharCode(10); outBody += NL + '<!--IGLOG' + NL + log.join(NL).slice(-8000) + NL + 'IGLOG-->'; } catch(e){} }
+  return res.status(200).send(outBody);
 }
 
 // ---------- Понятные ошибки ----------
@@ -88,16 +90,18 @@ function friendlyErrorObj(raw) {
     return {title:'Закончились дневные кредиты', advice:'Подожди до завтра или пополни баланс на naistera.org'};
   if (/insufficient credits/i.test(s))
     return {title:'Недостаточно кредитов', advice:'Пополни баланс на naistera.org'};
+  if (/invalid or revoked|revoked token|invalid[_\s]?token/i.test(s))
+    return {title:'Неправильный ключ', advice:'Ключ недействителен или отозван. Поменяйте ключ и пересоберите плагин на сайте', retry:false};
   if (/IMAGE_OTHER/i.test(s) || (/blocked/i.test(s) && /OTHER/i.test(s)))
-    return {title:'Контент заблокирован фильтром', advice:'Упрости промт, замени референс на нейтральный или смени модель'};
+    return {title:'Внутренняя цензура', advice:'Провайдер отклонил запрос. Поменяйте референсы или промт', retry:false};
   if (/IMAGE_SAFETY/i.test(s) || /safety/i.test(s))
-    return {title:'Контент заблокирован по безопасности', advice:'Измени описание сцены и попробуй снова'};
+    return {title:'Внутренняя цензура (безопасность)', advice:'Провайдер заблокировал по безопасности. Поменяйте референсы или смягчите промт', retry:false};
   if (/prohibited[_\s-]?content|content[_\s-]?prohibited|запрещённ|запрещенн/i.test(s))
-    return {title:'Контент заблокирован цензурой', advice:'Модель отказалась рисовать по этому запросу. Смягчи описание, замени референс или смени модель'};
+    return {title:'Внутренняя цензура', advice:'Провайдер отклонил запрос. Поменяйте референсы или промт', retry:false};
   if (/blocked/i.test(s) && /refunded/i.test(s))
-    return {title:'Заблокировано фильтром', advice:'Кредиты возвращены. Попробуй другой промт или модель'};
+    return {title:'Внутренняя цензура', advice:'Провайдер заблокировал запрос (кредиты возвращены). Поменяйте референсы или промт', retry:false};
   if (/possibly filtered/i.test(s) || /No images? (in response|generated)/i.test(s))
-    return {title:'Модель не вернула картинку', advice:'Скорее всего цензура. Упрости промт, облегчи референс (<1 МБ) или смени модель'};
+    return {title:'Внутренняя цензура', advice:'Провайдер отклонил запрос или не вернул картинку. Поменяйте референсы или промт', retry:false};
   if (/rate.?limit/i.test(s))
     return {title:'Слишком много запросов', advice:'Подожди минуту и попробуй снова'};
   if (/cannot import/i.test(s))
@@ -330,6 +334,14 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'GET') return res.status(405).end();
 
+  // Серверный лог -> в буфер, чтобы вернуть клиенту в отчёте об ошибке (console восстановим в finally).
+  const IGLOG = [];
+  const _log = console.log, _err = console.error, _warn = console.warn;
+  function _fmt(a){ try { return Array.prototype.map.call(a, function(x){ return typeof x === 'string' ? x : JSON.stringify(x); }).join(' '); } catch(e){ return ''; } }
+  console.log = function(){ try { IGLOG.push(_fmt(arguments)); } catch(e){} _log.apply(console, arguments); };
+  console.error = function(){ try { IGLOG.push('[error] ' + _fmt(arguments)); } catch(e){} _err.apply(console, arguments); };
+  console.warn = function(){ try { IGLOG.push('[warn] ' + _fmt(arguments)); } catch(e){} _warn.apply(console, arguments); };
+
   try {
     console.log('🚀 [2/9] Начало запроса');
     console.log('🔍 RAW data:', req.query.data?.slice(0, 80));
@@ -546,6 +558,8 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error('❌ Ошибка:', err.message);
     const fe = friendlyErrorObj(err.message);
-    return errorSvg(res, fe.title, fe.advice);
+    return errorSvg(res, fe.title, fe.advice, fe.retry, IGLOG);
+  } finally {
+    console.log = _log; console.error = _err; console.warn = _warn;
   }
 }
