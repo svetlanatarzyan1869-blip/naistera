@@ -316,7 +316,7 @@ async function fetchWithRetry(url, options, retries = 3, delay = 1500) {
 
     console.error(`❌ Naistera attempt ${attempt}/${retries} — HTTP ${res.status}`);
     console.error(`   Response: ${errorDetails.slice(0, 800)}`);
-    lastError = new Error(friendlyError(`Naistera HTTP ${res.status}: ${errorDetails}`));
+    lastError = new Error(`Naistera HTTP ${res.status}: ${errorDetails}`);
 
     if (res.status !== 502 && res.status !== 503) throw lastError;
     if (attempt < retries) {
@@ -539,7 +539,7 @@ export default async function handler(req, res) {
     if (!b64) {
       const rawMsg = naisteraData.error || naisteraData.message || JSON.stringify(naisteraData).slice(0, 400);
       console.error('❌ Full Naistera response:', JSON.stringify(naisteraData).slice(0, 1500));
-      throw new Error(friendlyError(rawMsg));
+      throw new Error(rawMsg);
     }
     console.log('✅ [7/9] Naistera ответила');
     const imageUrl = await uploadToImgBB(imgbb_key, b64);
