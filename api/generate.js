@@ -195,6 +195,19 @@ function decryptData(encryptedBase64, secretKeyBase64) {
   }
 }
 
+// DATA шифрует сервер сайта (tavo-hub /api/seal) ключом DATA_KEY из env.
+// ENCRYPTION_KEY — прежний ключ: он был виден в коде сайта, поэтому принимаем
+// его только если переменная заведена в env. 13.10.2026 её убрали: старые DATA не принимаются.
+function openData(data) {
+  const keys = [process.env.DATA_KEY, process.env.ENCRYPTION_KEY].filter(Boolean);
+  for (const k of keys) {
+    const d = decryptData(data, k);
+    if (d && typeof d === 'object') return d;
+  }
+  return null;
+}
+
+
 // ---------- Загрузка стилей ----------
 let styleMap = {};
 try {
@@ -346,11 +359,11 @@ export default async function handler(req, res) {
     console.log('🚀 [2/9] Начало запроса');
     console.log('🔍 RAW data:', req.query.data?.slice(0, 80));
 
-    const encryptionKey = process.env.ENCRYPTION_KEY;
+    const encryptionKey = process.env.DATA_KEY || process.env.ENCRYPTION_KEY;
     let key, charactersRaw, imgbb_key;
 
     if (req.query.data && encryptionKey) {
-      const decrypted = decryptData(req.query.data, encryptionKey);
+      const decrypted = openData(req.query.data);
       if (decrypted && typeof decrypted === 'object') {
         key = decrypted.key;
         imgbb_key = decrypted.imgbb_key;
