@@ -11,6 +11,17 @@ import { createRequire } from 'module';
 import Redis from 'ioredis';
 
 import crypto from 'crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+const _logStore = new AsyncLocalStorage();
+{
+  const _log = console.log, _err = console.error, _warn = console.warn;
+  const _fmt = (a) => { try { return Array.prototype.map.call(a, (x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' '); } catch (e) { return ''; } };
+  const _push = (prefix, a) => { const b = _logStore.getStore(); if (b) { try { b.push(prefix + _fmt(a)); } catch (e) {} } };
+  console.log = function () { _push('', arguments); _log.apply(console, arguments); };
+  console.error = function () { _push('[error] ', arguments); _err.apply(console, arguments); };
+  console.warn = function () { _push('[warn] ', arguments); _warn.apply(console, arguments); };
+}
 
 const require = createRequire(import.meta.url);
 
@@ -233,11 +244,13 @@ if (redisUrl) {
   redis.on('error', (err) => console.warn('Redis warning:', err.message));
 }
 
-function getCacheKey(userId, prompt, characters, style) {
+function getCacheKey(userId, prompt, characters, style, legacy) {
   let chars = [];
   try { chars = JSON.parse(characters || '[]'); chars.sort((a,b)=>a.name.localeCompare(b.name)); } catch(e) {}
-  const hash = Buffer.from(JSON.stringify({ userId, prompt, characters: chars, style })).toString('base64');
-  return `img:${hash}`;
+  const json = JSON.stringify({ userId, prompt, characters: chars, style });
+  // legacy — прежний формат (base64 с открытым текстом), только для чтения старых записей
+  if (legacy) return `img:${Buffer.from(json).toString('base64')}`;
+  return `img2:${crypto.createHash('sha256').update(json).digest('hex')}`;
 }
 
 async function fetchWithTimeout(url, options, timeoutMs) {
@@ -272,7 +285,7 @@ async function getRefDataUrl(url, redis) {
   if (redis) { try { const c = await redis.get(key); if (c) return c; } catch (e) {} }
   const { buf, contentType } = await fetchImageBuffer(url, 15000);
   const dataUrl = `data:${contentType};base64,${buf.toString('base64')}`;
-  if (redis) { try { await redis.set(key, dataUrl, 'EX', 604800); } catch (e) {} }
+  if (redis) { try { await redis.set(key, dataUrl, 'EX', 86400); } catch (e) {} }
   return dataUrl;
 }
 
@@ -340,44 +353,37 @@ async function fetchWithRetry(url, options, retries = 3, delay = 1500) {
   throw lastError;
 }
 
-export default async function handler(req, res) {
+async function handleRequest(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'GET') return res.status(405).end();
+  if (req.method !== 'GET' && req.method !== 'POST') return res.status(405).end();
+  // Новые плагины шлют POST с JSON — тогда DATA и текст сцены не попадают в адрес и логи запросов.
+  const Q = Object.assign({}, req.query || {}, (req.method === 'POST' && req.body && typeof req.body === 'object') ? req.body : {});
 
-  // Серверный лог -> в буфер, чтобы вернуть клиенту в отчёте об ошибке (console восстановим в finally).
-  const IGLOG = [];
-  const _log = console.log, _err = console.error, _warn = console.warn;
-  function _fmt(a){ try { return Array.prototype.map.call(a, function(x){ return typeof x === 'string' ? x : JSON.stringify(x); }).join(' '); } catch(e){ return ''; } }
-  console.log = function(){ try { IGLOG.push(_fmt(arguments)); } catch(e){} _log.apply(console, arguments); };
-  console.error = function(){ try { IGLOG.push('[error] ' + _fmt(arguments)); } catch(e){} _err.apply(console, arguments); };
-  console.warn = function(){ try { IGLOG.push('[warn] ' + _fmt(arguments)); } catch(e){} _warn.apply(console, arguments); };
+  const IGLOG = _logStore.getStore() || [];
 
   try {
     console.log('🚀 [2/9] Начало запроса');
-    console.log('🔍 RAW data:', req.query.data?.slice(0, 80));
 
     const encryptionKey = process.env.DATA_KEY || process.env.ENCRYPTION_KEY;
     let key, charactersRaw, imgbb_key;
 
-    if (req.query.data && encryptionKey) {
-      const decrypted = openData(req.query.data);
+    if (Q.data && encryptionKey) {
+      const decrypted = openData(Q.data);
       if (decrypted && typeof decrypted === 'object') {
         key = decrypted.key;
         imgbb_key = decrypted.imgbb_key;
-        charactersRaw = decrypted.characters || req.query.characters;
+        charactersRaw = decrypted.characters || Q.characters;
         console.log('✅ [3/9] Данные расшифрованы');
       } else {
         console.error('❌ [3/9] Ошибка расшифровки');
         return errorSvg(res, 'Ошибка расшифровки данных', 'Ключ шифрования не совпадает. Перешифруй ключи заново на сайте настройки и обнови DATA в промте');
       }
     } else {
-      key = req.query.key;
-      charactersRaw = req.query.characters;
-      imgbb_key = req.query.imgbb_key;
-      console.log('⚠️ [3/9] Незашифрованный запрос');
+      console.error('❌ [3/9] Нет DATA');
+      return errorSvg(res, 'Плагин устарел', 'Пересоберите плагин на tavo-hub.vercel.app', false);
     }
 
     // Чистим ключи от «умных» символов (автозамена телефона: – — → -, неразрывные пробелы, кавычки)
@@ -400,12 +406,11 @@ export default async function handler(req, res) {
         console.log('🔓 characters decoded');
       } catch (e) { console.warn('Decode failed', e.message); }
     }
-    console.log('🔍 charactersRaw:', charactersRaw);
 
-    const userId = req.query.userId;
-    const prompt = req.query.prompt;
-    const style = req.query.style;
-    const model = req.query.model || 'gemini-3.1-flash-image-preview';
+    const userId = Q.userId;
+    const prompt = Q.prompt;
+    const style = Q.style;
+    const model = Q.model || 'gemini-3.1-flash-image-preview';
 
     if (!key || !prompt || !userId) {
       console.error(`❌ 400: key=${!!key}, prompt=${!!prompt}, userId=${!!userId}`);
@@ -460,7 +465,7 @@ export default async function handler(req, res) {
     const NAISTERA_REF_MODELS = ['nano banana 2', 'grok'];   // рефы работают только тут
     const naisteraModel = (model && String(model).trim()) || 'nano banana 2';
     const refsSupported = NAISTERA_REF_MODELS.includes(naisteraModel.toLowerCase());
-    const aspectRatio = (req.query.aspect_ratio || req.query.aspectRatio || '3:2');
+    const aspectRatio = (Q.aspect_ratio || Q.aspectRatio || '3:2');
 
     // Жёсткая инструкция: точное соответствие лиц референсам.
     // Только когда рефы реально уйдут в запрос — иначе модель (novelai/grok-pro)
@@ -477,9 +482,10 @@ export default async function handler(req, res) {
     // в историю на клиенте сохраняется именно этот URL (с _r), и при листании
     // рероллов он запрашивается снова. Раньше _r отключал кэш → каждое листание
     // жгло токены заново. Теперь новый _r = новая генерация, повтор того же _r = кэш.
-    const rerollTag = String(req.query._r || '');
+    const rerollTag = String(Q._r || '');
     const isReroll = !!rerollTag;
     const cacheKey = getCacheKey(userId, prompt, charactersRaw, finalStyle + '|r=' + rerollTag);
+    const legacyCacheKey = getCacheKey(userId, prompt, charactersRaw, finalStyle + '|r=' + rerollTag, true);
     let cachedUrl = null;
     let lockAcquired = false;
     const lockKey = `lock:${cacheKey}`;
@@ -488,7 +494,7 @@ export default async function handler(req, res) {
       console.log('🔄 [5/9] Проверка кэша...');
       // Весь блок кэша/лока обёрнут: любой сбой/таймаут Redis → генерим без кэша, не виснем.
       try {
-        cachedUrl = await redis.get(cacheKey);
+        cachedUrl = (await redis.get(cacheKey)) || (await redis.get(legacyCacheKey));
         if (!cachedUrl) {
           const locked = await redis.set(lockKey, 'locked', 'EX', 2, 'NX');
           if (locked) {
@@ -572,7 +578,13 @@ export default async function handler(req, res) {
     console.error('❌ Ошибка:', err.message);
     const fe = friendlyErrorObj(err.message);
     return errorSvg(res, fe.title, fe.advice, fe.retry, IGLOG);
-  } finally {
-    console.log = _log; console.error = _err; console.warn = _warn;
   }
+}
+
+// Журнал запроса для отчёта об ошибке. Раньше console подменялся глобально на время
+// запроса, и при одновременных запросах строки одного юзера попадали в ответ другому.
+// Теперь console подменён один раз, а строка уходит в буфер ТОГО запроса, в котором
+// она написана (AsyncLocalStorage). Вне запроса — только в обычный лог.
+export default function handler(req, res) {
+  return _logStore.run([], () => handleRequest(req, res));
 }
