@@ -14,13 +14,29 @@ import crypto from 'crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 const _logStore = new AsyncLocalStorage();
+// Пока идёт запрос, строки console копятся в буфер ЭТОГО запроса (AsyncLocalStorage) и
+// в конце уходят в лог Vercel ОДНОЙ записью — все этапы одного юзера вместе, чужие не вклиниваются.
+const _out = { log: console.log, warn: console.warn, error: console.error };
 {
-  const _log = console.log, _err = console.error, _warn = console.warn;
   const _fmt = (a) => { try { return Array.prototype.map.call(a, (x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' '); } catch (e) { return ''; } };
-  const _push = (prefix, a) => { const b = _logStore.getStore(); if (b) { try { b.push(prefix + _fmt(a)); } catch (e) {} } };
-  console.log = function () { _push('', arguments); _log.apply(console, arguments); };
-  console.error = function () { _push('[error] ', arguments); _err.apply(console, arguments); };
-  console.warn = function () { _push('[warn] ', arguments); _warn.apply(console, arguments); };
+  const _rank = { log: 0, warn: 1, error: 2 };
+  const _wrap = (lvl, prefix) => function () {
+    const b = _logStore.getStore();
+    if (b && !b.done) {
+      try { b.push(prefix + _fmt(arguments)); if (_rank[lvl] > _rank[b.lvl || 'log']) b.lvl = lvl; } catch (e) {}
+      return;
+    }
+    _out[lvl].apply(console, arguments);
+  };
+  console.log = _wrap('log', '');
+  console.warn = _wrap('warn', '[warn] ');
+  console.error = _wrap('error', '[error] ');
+}
+function _flushLog(b) {
+  const from = b.flushed || 0;
+  if (b.length <= from) return;
+  b.flushed = b.length;
+  try { _out[b.lvl || 'log'].call(console, b.slice(from).join('\n')); } catch (e) {}
 }
 
 const require = createRequire(import.meta.url);
@@ -270,7 +286,14 @@ async function fetchImageBuffer(url, timeoutMs = 15000) {
       if (match) { console.log(`🔗 Fixed ImgBB URL: ${url} → ${match[0]}`); url = match[0]; }
     } catch(e) { console.warn('ImgBB URL fix failed:', e.message); }
   }
-  const res = await fetchWithTimeout(url, { headers: { Accept: 'image/*' } }, timeoutMs);
+  let res;
+  try {
+    res = await fetchWithTimeout(url, { headers: { Accept: 'image/*' } }, timeoutMs);
+  } catch (e) {
+    // Сетевой сбой (не HTTP-ответ) — ещё одна попытка с браузерным User-Agent
+    console.warn('   ↻ реф: повтор после ' + e.message + (e.cause && e.cause.code ? ' (' + e.cause.code + ')' : ''));
+    res = await fetchWithTimeout(url, { headers: { Accept: 'image/*', 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36' } }, timeoutMs);
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const contentType = res.headers.get('content-type') || 'image/png';
   if (!contentType.startsWith('image/')) throw new Error(`Not an image: ${contentType}`);
@@ -526,7 +549,7 @@ async function handleRequest(req, res) {
           const dataUrl = await getRefDataUrl(c.url, redis);
           console.log(`   ✅ "${c.name}" готов`);
           return dataUrl;
-        } catch(e) { console.warn(`   ⚠️ "${c.name}" пропущен: ${e.message}`); return null; }
+        } catch(e) { console.warn(`   ⚠️ "${c.name}" пропущен: ${e.message}${e.cause && e.cause.code ? ' (' + e.cause.code + ')' : ''}`); return null; }
       }));
       for (const du of refResults) { if (du) referenceImages.push(du); }
     } else {
@@ -581,10 +604,13 @@ async function handleRequest(req, res) {
   }
 }
 
-// Журнал запроса для отчёта об ошибке. Раньше console подменялся глобально на время
-// запроса, и при одновременных запросах строки одного юзера попадали в ответ другому.
-// Теперь console подменён один раз, а строка уходит в буфер ТОГО запроса, в котором
-// она написана (AsyncLocalStorage). Вне запроса — только в обычный лог.
+// Журнал запроса: свой буфер на каждый запрос (идёт и в отчёт об ошибке, и одной записью в лог Vercel).
 export default function handler(req, res) {
-  return _logStore.run([], () => handleRequest(req, res));
+  const buf = [];
+  // Hobby режет функцию на 60с — выводим накопленное чуть раньше, чтобы журнал не пропал.
+  const t = setTimeout(() => { buf.push('[warn] ⏱ 55с — запрос ещё идёт, журнал выведен заранее'); _flushLog(buf); }, 55000);
+  return _logStore.run(buf, async () => {
+    try { return await handleRequest(req, res); }
+    finally { clearTimeout(t); _flushLog(buf); buf.done = true; }
+  });
 }
