@@ -42,9 +42,53 @@ function _flushLog(b) {
 const require = createRequire(import.meta.url);
 
 // Vercel Hobby жёстко режет функцию на 60с; >60 просто клампится. Поднимать до 300 после Pro.
-export const maxDuration = 60;
+export const maxDuration = 300;
 
 // ---------- SVG-ошибка ----------
+// ── Поток с «пульсом» (stream=1) ─────────────────────────────────────────────
+// Телефон (iOS) обрывает запрос, если за 60с от сервера не пришло НИ ОДНОГО байта,
+// а генерация столько идёт. Поэтому в этом режиме отвечаем 200 сразу, шлём строку
+// каждые 5с, а в конце — строку с готовой ссылкой. Формат: по JSON-объекту на строку.
+// Старые плагины (без stream=1) получают всё как раньше: 302 на картинку или SVG-ошибку.
+function makeResponder(res, Q) {
+  const on = String(Q.stream == null ? '' : Q.stream) === '1';
+  const t0 = Date.now();
+  let hb = null, started = false;
+  function write(obj) {
+    try { res.write(JSON.stringify(obj) + String.fromCharCode(10)); if (typeof res.flush === 'function') res.flush(); } catch (e) {}
+  }
+  function stop() { if (hb) { clearInterval(hb); hb = null; } }
+  return {
+    on,
+    // вызывается ДО долгой работы: заголовки уходят клиенту немедленно
+    start() {
+      if (!on || started) return;
+      started = true;
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Accel-Buffering', 'no'); // не копить ответ в буфере прокси
+      write({ t: 'start' });
+      hb = setInterval(() => write({ t: 'ping', s: Math.round((Date.now() - t0) / 1000) }), 5000);
+      if (hb && typeof hb.unref === 'function') hb.unref();
+    },
+    done(url) {
+      if (!on) return res.redirect(302, url);
+      stop(); write({ t: 'done', url: String(url), s: Math.round((Date.now() - t0) / 1000) });
+      return res.end();
+    },
+    fail(title, advice, retry, log) {
+      if (!on) return errorSvg(res, title, advice, retry, log);
+      stop();
+      write({ t: 'error', title: String(title || ''), advice: String(advice || ''), retry: retry === false ? false : true,
+              log: (log && log.length) ? log.join(String.fromCharCode(10)).slice(-4000) : '' });
+      return res.end();
+    }
+  };
+}
+
+export const __test = { makeResponder }; // только для тестов сборки
+
 function errorSvg(res, title, advice, retry, log) {
   const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   // Перенос строк для совета
@@ -386,6 +430,8 @@ async function handleRequest(req, res) {
   const Q = Object.assign({}, req.query || {}, (req.method === 'POST' && req.body && typeof req.body === 'object') ? req.body : {});
 
   const IGLOG = _logStore.getStore() || [];
+  const out = makeResponder(res, Q);
+  out.start(); // заголовки уходят ДО генерации — телефон видит, что сервер жив
 
   try {
     console.log('🚀 [2/9] Начало запроса');
@@ -402,11 +448,11 @@ async function handleRequest(req, res) {
         console.log('✅ [3/9] Данные расшифрованы');
       } else {
         console.error('❌ [3/9] Ошибка расшифровки');
-        return errorSvg(res, 'Ошибка расшифровки данных', 'Ключ шифрования не совпадает. Перешифруй ключи заново на сайте настройки и обнови DATA в промте');
+        return out.fail('Ошибка расшифровки данных', 'Ключ шифрования не совпадает. Перешифруй ключи заново на сайте настройки и обнови DATA в промте');
       }
     } else {
       console.error('❌ [3/9] Нет DATA');
-      return errorSvg(res, 'Плагин устарел', 'Пересоберите плагин на tavo-hub.vercel.app', false);
+      return out.fail('Плагин устарел', 'Пересоберите плагин на tavo-hub.vercel.app', false);
     }
 
     // Чистим ключи от «умных» символов (автозамена телефона: – — → -, неразрывные пробелы, кавычки)
@@ -437,11 +483,11 @@ async function handleRequest(req, res) {
 
     if (!key || !prompt || !userId) {
       console.error(`❌ 400: key=${!!key}, prompt=${!!prompt}, userId=${!!userId}`);
-      return errorSvg(res, 'Неполная конфигурация', 'Отсутствует ключ, промт или userId. Перешифруй данные на сайте настройки');
+      return out.fail('Неполная конфигурация', 'Отсутствует ключ, промт или userId. Перешифруй данные на сайте настройки');
     }
     if (!imgbb_key) {
       console.error('❌ 400: imgbb_key missing');
-      return errorSvg(res, 'Отсутствует ImgBB ключ', 'Перешифруй данные, указав оба ключа');
+      return out.fail('Отсутствует ImgBB ключ', 'Перешифруй данные, указав оба ключа');
     }
     console.log(`✅ [3/9] userId: ${userId}, model: ${model}`);
 
@@ -527,13 +573,13 @@ async function handleRequest(req, res) {
             console.log(`⏳ Ожидание блокировки`);
             await new Promise(resolve => setTimeout(resolve, 600));
             const retryCache = await redis.get(cacheKey);
-            if (retryCache) return res.redirect(302, retryCache);
+            if (retryCache) return out.done(retryCache);
             else { try { await redis.del(lockKey); } catch(e){} }
           }
         }
       } catch(e) { console.warn('Redis error (пропускаю кэш):', e.message); cachedUrl = null; }
     }
-    if (cachedUrl) return res.redirect(302, cachedUrl);
+    if (cachedUrl) return out.done(cachedUrl);
     console.log(isReroll ? '🔁 [5/9] Генерация (реролл)' : '❌ [5/9] Кэш промах, генерация');
 
     console.log(`🤖 [7/9] Запрос в Naistera (${naisteraModel}, ${aspectRatio})...`);
@@ -596,18 +642,18 @@ async function handleRequest(req, res) {
       } catch(e) { console.warn('Redis set error:', e.message); }
     }
 
-    return res.redirect(302, imageUrl);
+    return out.done(imageUrl);
   } catch (err) {
     console.error('❌ Ошибка:', err.message);
     const fe = friendlyErrorObj(err.message);
-    return errorSvg(res, fe.title, fe.advice, fe.retry, IGLOG);
+    return out.fail(fe.title, fe.advice, fe.retry, IGLOG);
   }
 }
 
 // Журнал запроса: свой буфер на каждый запрос (идёт и в отчёт об ошибке, и одной записью в лог Vercel).
 export default function handler(req, res) {
   const buf = [];
-  // Hobby режет функцию на 60с — выводим накопленное чуть раньше, чтобы журнал не пропал.
+  // Журнал выводим заранее, чтобы он не пропал, если функцию всё же срежут по времени.
   const t = setTimeout(() => { buf.push('[warn] ⏱ 55с — запрос ещё идёт, журнал выведен заранее'); _flushLog(buf); }, 55000);
   return _logStore.run(buf, async () => {
     try { return await handleRequest(req, res); }
