@@ -12,6 +12,7 @@ import Redis from 'ioredis';
 
 import crypto from 'crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { generateCustom, checkUrl, rateLimit } from './_custom.js';
 
 const _logStore = new AsyncLocalStorage();
 // Пока идёт запрос, строки console копятся в буфер ЭТОГО запроса (AsyncLocalStorage) и
@@ -72,9 +73,9 @@ function makeResponder(res, Q) {
       hb = setInterval(() => write({ t: 'ping', s: Math.round((Date.now() - t0) / 1000) }), 5000);
       if (hb && typeof hb.unref === 'function') hb.unref();
     },
-    done(url) {
+    done(url, extra) {
       if (!on) return res.redirect(302, url);
-      stop(); write({ t: 'done', url: String(url), s: Math.round((Date.now() - t0) / 1000) });
+      stop(); write(Object.assign({ t: 'done', url: String(url), s: Math.round((Date.now() - t0) / 1000) }, extra || {}));
       return res.end();
     },
     fail(title, advice, retry, log) {
@@ -438,6 +439,7 @@ async function handleRequest(req, res) {
 
     const encryptionKey = process.env.DATA_KEY || process.env.ENCRYPTION_KEY;
     let key, charactersRaw, imgbb_key;
+    let isCustom = false, customBase = '';
 
     if (Q.data && encryptionKey) {
       const decrypted = openData(Q.data);
@@ -445,7 +447,9 @@ async function handleRequest(req, res) {
         key = decrypted.key;
         imgbb_key = decrypted.imgbb_key;
         charactersRaw = decrypted.characters || Q.characters;
-        console.log('✅ [2/8] Данные расшифрованы');
+        isCustom = decrypted._provider === 'custom';
+        customBase = isCustom ? String(decrypted.base || '') : '';
+        console.log('✅ [2/8] Данные расшифрованы' + (isCustom ? ' (свой провайдер)' : ''));
       } else {
         console.error('❌ [2/8] Ошибка расшифровки');
         return out.fail('Ошибка расшифровки данных', 'Ключ шифрования не совпадает. Перешифруй ключи заново на сайте настройки и обнови DATA в промте');
@@ -490,6 +494,11 @@ async function handleRequest(req, res) {
       return out.fail('Отсутствует ImgBB ключ', 'Перешифруй данные, указав оба ключа');
     }
     console.log(`✅ [2/8] userId: ${userId}, model: ${model}`);
+    if (isCustom) {
+      if (!customBase) return out.fail('Не указан адрес провайдера', 'Впиши адрес на сайте и пересобери плагин.', false);
+      customBase = await checkUrl(customBase);   // только https, никаких внутренних адресов
+      await rateLimit(redis, userId);
+    }
 
     // Стиль: ключ из каталога → его описание; иначе произвольный текст юзера как есть;
     // иначе дефолт. Лимит — чтобы длинное полотно не съедало таймаут генерации.
@@ -533,7 +542,8 @@ async function handleRequest(req, res) {
     // ---- Модель и поддержка референсов ----
     const NAISTERA_REF_MODELS = ['nano banana 2', 'grok'];   // рефы работают только тут
     const naisteraModel = (model && String(model).trim()) || 'nano banana 2';
-    const refsSupported = NAISTERA_REF_MODELS.includes(naisteraModel.toLowerCase());
+    // свой провайдер: рефы пробуем всегда — примет или нет, узнаем по ответу
+    const refsSupported = isCustom ? true : NAISTERA_REF_MODELS.includes(naisteraModel.toLowerCase());
     const aspectRatio = (Q.aspect_ratio || Q.aspectRatio || '3:2');
 
     // Жёсткая инструкция: точное соответствие лиц референсам.
@@ -545,6 +555,7 @@ async function handleRequest(req, res) {
       faceLock = `[CRITICAL: The reference image(s) show the EXACT appearance of ${named.join(' and ')}. You MUST precisely copy their: face structure, eye color, hair color and style, skin tone, body type, clothing, and all distinctive features. Do not deviate from the reference appearances.]\n\n`;
     }
     const fullPrompt = `${faceLock}${finalStyle}\n\n${cleanPrompt}`;
+    const plainPrompt = `${finalStyle}\n\n${cleanPrompt}`; // без «копируй лица» — на случай, если рефы не пройдут
 
     // ---- Кэш и блокировка ----
     // Каждый реролл кэшируется ОТДЕЛЬНО — по своему _r. Это принципиально:
@@ -553,7 +564,8 @@ async function handleRequest(req, res) {
     // жгло токены заново. Теперь новый _r = новая генерация, повтор того же _r = кэш.
     const rerollTag = String(Q._r || '');
     const isReroll = !!rerollTag;
-    const cacheKey = getCacheKey(userId, prompt, charactersRaw, finalStyle + '|r=' + rerollTag);
+    const provTag = isCustom ? ('|c=' + customBase + '|' + naisteraModel) : '';
+    const cacheKey = getCacheKey(userId, prompt, charactersRaw, finalStyle + provTag + '|r=' + rerollTag);
     const legacyCacheKey = getCacheKey(userId, prompt, charactersRaw, finalStyle + '|r=' + rerollTag, true);
     let cachedUrl = null;
     let lockAcquired = false;
@@ -582,14 +594,14 @@ async function handleRequest(req, res) {
     if (cachedUrl) return out.done(cachedUrl);
     console.log(isReroll ? '🔁 [4/8] Генерация (реролл)' : '❌ [4/8] Кэш промах, генерация');
 
-    console.log(`🤖 [6/8] Запрос в Naistera (${naisteraModel}, ${aspectRatio})...`);
+    console.log(isCustom ? `🤖 [6/8] Запрос к своему провайдеру (${naisteraModel}, ${aspectRatio})...` : `🤖 [6/8] Запрос в Naistera (${naisteraModel}, ${aspectRatio})...`);
 
     // ---- Референсы: скачиваем с ImgBB → data URL (Naistera ждёт именно data URL) ----
     const referenceImages = [];
     if (refsSupported) {
       // ПАРАЛЛЕЛЬНО, с таймаутом (15с) и кэшем в Redis (лимит Naistera — 5).
       // Медленный/битый реф пропускается, а не ждём его до 60с последовательно.
-      const refChars = chars.filter(c => c && c.url).slice(0, 5);
+      const refChars = chars.filter(c => c && c.url).slice(0, isCustom ? 4 : 5);
       const refResults = await Promise.all(refChars.map(async (c) => {
         try {
           const dataUrl = await getRefDataUrl(c.url, redis);
@@ -602,34 +614,40 @@ async function handleRequest(req, res) {
       console.log(`   ℹ️ Модель "${naisteraModel}" не поддерживает референсы — пропускаем`);
     }
 
-    // ---- Тело запроса ----
-    const naisteraBody = {
-      prompt: fullPrompt,
-      aspect_ratio: aspectRatio,
-      model: naisteraModel,
-    };
-    if (referenceImages.length > 0) naisteraBody.reference_images = referenceImages;
+    let b64 = null, note = '';
+    if (isCustom) {
+      const r = await generateCustom({ base: customBase, key, model: naisteraModel, prompt: plainPrompt, faceLock, refs: referenceImages, aspectRatio, redis });
+      b64 = r.b64; note = r.note;
+      console.log('✅ [6/8] Провайдер ответил' + (note === 'no_refs' ? ' (без референсов)' : ''));
+    } else {
+      // ---- Тело запроса ----
+      const naisteraBody = {
+        prompt: fullPrompt,
+        aspect_ratio: aspectRatio,
+        model: naisteraModel,
+      };
+      if (referenceImages.length > 0) naisteraBody.reference_images = referenceImages;
 
-    const naisteraRes = await fetchWithRetry('https://naistera.org/api/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-      body: JSON.stringify(naisteraBody),
-    });
-    const naisteraData = await naisteraRes.json();
-    console.log('🔍 Naistera response keys:', JSON.stringify(Object.keys(naisteraData)));
+      const naisteraRes = await fetchWithRetry('https://naistera.org/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+        body: JSON.stringify(naisteraBody),
+      });
+      const naisteraData = await naisteraRes.json();
+      console.log('🔍 Naistera response keys:', JSON.stringify(Object.keys(naisteraData)));
 
-    // ---- Ответ: { data_url: "data:image/png;base64,..." } ----
-    let b64 = null;
-    if (naisteraData.data_url && typeof naisteraData.data_url === 'string') {
-      const m = naisteraData.data_url.match(/base64,([a-zA-Z0-9+/=]+)/);
-      if (m) b64 = m[1];
+      // ---- Ответ: { data_url: "data:image/png;base64,..." } ----
+      if (naisteraData.data_url && typeof naisteraData.data_url === 'string') {
+        const m = naisteraData.data_url.match(/base64,([a-zA-Z0-9+/=]+)/);
+        if (m) b64 = m[1];
+      }
+      if (!b64) {
+        const rawMsg = naisteraData.error || naisteraData.message || JSON.stringify(naisteraData).slice(0, 400);
+        console.error('❌ Full Naistera response:', JSON.stringify(naisteraData).slice(0, 1500));
+        throw new Error(rawMsg);
+      }
+      console.log('✅ [6/8] Naistera ответила');
     }
-    if (!b64) {
-      const rawMsg = naisteraData.error || naisteraData.message || JSON.stringify(naisteraData).slice(0, 400);
-      console.error('❌ Full Naistera response:', JSON.stringify(naisteraData).slice(0, 1500));
-      throw new Error(rawMsg);
-    }
-    console.log('✅ [6/8] Naistera ответила');
     const imageUrl = await uploadToImgBB(imgbb_key, b64);
 
     console.log(`✅ [7/8] Изображение готово`);
@@ -642,10 +660,10 @@ async function handleRequest(req, res) {
       } catch(e) { console.warn('Redis set error:', e.message); }
     }
 
-    return out.done(imageUrl);
+    return out.done(imageUrl, note ? { note } : null);
   } catch (err) {
     console.error('❌ Ошибка:', err.message);
-    const fe = friendlyErrorObj(err.message);
+    const fe = err && err.igTitle ? { title: err.igTitle, advice: err.igAdvice, retry: err.igRetry !== false } : friendlyErrorObj(err.message);
     return out.fail(fe.title, fe.advice, fe.retry, IGLOG);
   }
 }
